@@ -1,0 +1,27 @@
+# Hermes Agent on Hugging Face Spaces
+# Python 依赖
+
+# 核心依赖
+huggingface-hub>=0.20.0
+datasets>=2.14.0
+requests>=2.31.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# 数据处理和加密
+cryptography>=41.0.0
+
+# 日志和监控
+loguru>=0.7.0
+psutil>=5.9.0
+
+# 异步支持
+aiohttp>=3.9.0
+aiocron>=1.8
+
+# 工具
+click>=8.1.0
+rich>=13.0.0
+
+# 文件监控（实时同步配置变更）
+watchdog>=3.0.0

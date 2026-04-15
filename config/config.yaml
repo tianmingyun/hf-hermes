@@ -1,0 +1,46 @@
+# Hermes Agent Configuration
+# Default configuration for Hugging Face Spaces deployment
+
+model:
+  provider: openrouter
+  name: openrouter/free
+  temperature: 0.7
+  max_tokens: 4096
+  top_p: 0.9
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+
+terminal:
+  backend: local
+  timeout: 300
+  shell: /bin/bash
+
+display:
+  skin: default
+  show_tool_progress: true
+  show_resume: true
+  spinner: dots
+
+agent:
+  max_iterations: 50
+  approval_mode: ask
+  dangerous_command_approval: ask
+  gateway_timeout: 300
+
+memory:
+  enabled: true
+  provider: local
+
+compression:
+  enabled: true
+  threshold: 4000
+
+cron:
+  enabled: true
+  tick_interval: 60
+
+delegation:
+  max_subagents: 3
+  reasoning_effort: medium
+
+# Gateway configuration will be auto-detected from environment variables
