@@ -21,12 +21,17 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
+# 安装 yq (YAML 处理工具，用于运行时修改 config.yaml)
+RUN curl -sL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/bin/yq && \
+    chmod +x /usr/bin/yq
+
 # 安装 Python 依赖
 COPY requirements.txt /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# 克隆 Hermes Agent 仓库并本地构建前端
-RUN git clone --depth 1 --branch v2026.4.13 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
+# 克隆 Hermes Agent 仓库并本地构建前端（使用最新版本）
+# 移除 --branch 参数以始终获取最新代码，配合 --no-cache 确保每次都重新克隆
+RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes-agent && \
     cd /tmp/hermes-agent/web && \
     npm install && \
     npm run build

@@ -1,46 +1,92 @@
 # Hermes Agent Configuration
-# Default configuration for Hugging Face Spaces deployment
+# 默认配置 for Hugging Face Spaces deployment
+# 格式来源: cli-config.yaml.example + hermes_cli/config.py
 
+# 主模型配置
 model:
-  provider: openrouter
-  name: openrouter/free
-  temperature: 0.7
-  max_tokens: 4096
-  top_p: 0.9
-  frequency_penalty: 0.0
-  presence_penalty: 0.0
+  default: "moonshotai/kimi-k2-thinking"
+  provider: "nvidia"
+  base_url: "https://integrate.api.nvidia.com/v1"
 
+# 辅助模型配置 (per-task overrides)
+auxiliary:
+  vision:
+    provider: "auto"
+    model: ""
+    timeout: 120
+    download_timeout: 30
+  web_extract:
+    provider: "auto"
+    model: ""
+    timeout: 360
+  compression:
+    provider: "auto"
+    model: ""
+    timeout: 120
+  title_generation:
+    provider: "auto"
+    model: ""
+    timeout: 30
+  session_search:
+    provider: "auto"
+    model: ""
+    timeout: 30
+  skills_hub:
+    provider: "auto"
+    model: ""
+    timeout: 30
+  approval:
+    provider: "auto"
+    model: ""
+    timeout: 30
+  mcp:
+    provider: "auto"
+    model: ""
+    timeout: 30
+  flush_memories:
+    provider: "auto"
+    model: ""
+    timeout: 30
+
+# 子代理 (Delegation) 配置
+delegation:
+  model: ""
+  provider: ""
+  max_iterations: 50
+  reasoning_effort: "medium"
+
+# 终端配置
 terminal:
   backend: local
   timeout: 300
   shell: /bin/bash
 
+# 显示配置
 display:
   skin: default
   show_tool_progress: true
   show_resume: true
   spinner: dots
 
+# Agent 配置
 agent:
   max_iterations: 50
   approval_mode: ask
   dangerous_command_approval: ask
   gateway_timeout: 300
 
+# 记忆配置
 memory:
   enabled: true
   provider: local
 
+# 压缩配置
+# threshold 是比率（0-1），不是 token 数。0.50 = 当上下文使用到模型 context 50% 时触发压缩
 compression:
   enabled: true
-  threshold: 4000
+  threshold: 0.50
 
+# 定时任务
 cron:
   enabled: true
   tick_interval: 60
-
-delegation:
-  max_subagents: 3
-  reasoning_effort: medium
-
-# Gateway configuration will be auto-detected from environment variables
