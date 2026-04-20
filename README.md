@@ -1,3 +1,66 @@
+4.20更新了哪些内容
+
+### 1. 备份恢复不再覆盖模型配置
+
+**改动文件**：`src/data_sync.py`
+
+之前的工作流程是：Space 启动 → 从 Dataset 恢复旧配置（覆盖新配置）→ 启动 Hermes。这导致每次重启后模型配置都被旧数据覆盖。
+
+现在的流程是：Space 启动 → 从 Dataset 恢复其他数据（聊天记录、人格设定等）→ **跳过 config.yaml** → 由启动脚本根据当前环境变量重新生成配置。
+
+具体来说，`data_sync.py` 的 `restore_from_download()` 方法现在会：
+- 默认跳过 `config.yaml` 的恢复（由环境变量 `SKIP_CONFIG_RESTORE=true` 控制）
+- 仅在本地完全不存在 config.yaml 时，才从备份中恢复一份作为初始值
+- 其他数据（聊天记录、人格、技能等）照常恢复，不受影响
+
+### 2. 三层防覆盖机制保护模型配置
+
+**改动文件**：`entrypoint.sh`
+
+即使跳过了旧配置恢复，Hermes 内部仍然有一个"配置桥接"机制，会在启动时自动检测 API Key 并可能修改 config.yaml。为了防止这种情况，我们增加了三层保护：
+
+**第一层：环境变量注入**
+- 在 Hermes 启动前，将所有供应商的 Base URL 导出到进程环境变量中
+- 导出 `HERMES_MODEL` 环境变量，确保定时任务等场景也使用正确的模型
+- 环境变量列表包括：`NVIDIA_BASE_URL`、`SILICONFLOW_BASE_URL`、`GEMINI_BASE_URL`、`OPENROUTER_BASE_URL`、`LONGCAT_BASE_URL`
+
+**第二层：启动前强制锁定**
+- 在 Dashboard 启动前，通过 `hermes config set` 命令将模型配置写入 config.yaml
+- 如果 `hermes config set` 不可用，回退到 `yq` 工具直接修改 YAML 文件
+- 修改后立刻用 `yq` 读取验证，确认模型字段没有被意外修改
+
+**第三层：启动后二次验证**
+- Dashboard 改为后台启动，等待 5 秒初始化
+- 再次读取 config.yaml，检查模型配置是否被 Dashboard 启动流程覆盖
+- 如果发现被修改或被清空，立即用 `yq` 修正回正确值
+- 没有 `yq` 时回退到 `sed` 做局部修改（不会破坏其他配置项）
+
+### 3. 修复压缩阈值错误
+
+**改动文件**：`entrypoint.sh`、`config/config.yaml`
+
+Hermes 的 `compression.threshold` 是一个**比率值**（0 到 1 之间的小数），不是绝对 token 数。例如 0.50 表示"当对话上下文使用到模型上下文窗口的 50% 时触发压缩"。
+
+之前的配置写了 `threshold: 4000`，Hermes 把它当作"400000%"来计算，得出的压缩阈值为 8.19 亿 tokens，远超压缩模型 100 万 tokens 的处理能力，导致压缩功能完全失效。
+
+现在改为 `threshold: 0.50`，含义清晰：对话上下文达到模型上限的 50% 时触发压缩，压缩模型 `gemini-3-flash-preview`（1M 上下文）完全能够处理。
+
+### 4. Dockerfile 支持自动更新和 YAML 处理
+
+**改动文件**：`Dockerfile`
+
+- 移除了 `--branch v2026.4.13` 固定版本参数，改为始终拉取最新代码。这样在 Hugging Face Space 的 Settings 页面点击 **Factory Rebuild**，就会自动获取 Hermes Agent 的最新版本
+- 新增安装 `yq`（YAML 处理工具），用于运行时精确修改 config.yaml 中的特定字段，而不是覆盖整个文件
+
+### 5. 更新默认模型
+
+**改动文件**：`entrypoint.sh`、`config/config.yaml`
+
+NVIDIA 供应商的默认模型从 `minimaxai/minimax-m2.7`（该模型在实际使用中无响应）更换为 `moonshotai/kimi-k2-thinking`。
+
+
+
+
 # Hermes Agent v0.9.0 on Hugging Face Spaces
 
 智能AI代理，支持16个消息平台，持久化记忆，和Web管理界面。
