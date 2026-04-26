@@ -2,14 +2,15 @@
 # Entrypoint script for Hermes Agent on Hugging Face Spaces
 # 基于 Hermes Agent 真实 config.yaml 格式（source: cli-config.yaml.example + hermes_cli/config.py）
 #
-# Hermes config.yaml 真实结构：
-#   model:        主模型 (default, provider, base_url, api_key)
-#   auxiliary:    辅助模型 (vision, web_extract, compression, etc.)
-#   delegation:   子代理配置 (model, provider, base_url, api_key, max_iterations, reasoning_effort)
+# 启动架构:
+#   entrypoint.sh
+#     ├── data_sync daemon (后台, 数据持久化)
+#     ├── hermes gateway run (后台, API Server :8642 + 消息平台)
+#     └── node /opt/hermes-web-ui/dist/server/index.js (前台, BFF :7860, 替代 hermes dashboard)
 
 set -e
 
-echo "🚀 Hermes Agent v0.9.0 - Hugging Face Spaces"
+echo "🚀 Hermes Agent v0.10.0 - Hugging Face Spaces"
 echo "=============================================="
 
 # 检查必要的环境变量
@@ -17,15 +18,16 @@ if [ -z "$HF_DATASET_REPO" ]; then
     echo "⚠️  警告: HF_DATASET_REPO 未设置，数据将不会持久化到 Dataset"
 fi
 
-# 创建必要的目录
+# ==================== 初始化目录 ====================
 echo "📁 初始化目录结构..."
 mkdir -p /data/.hermes/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache,whatsapp/session}
+mkdir -p /data/.hermes-web-ui
 mkdir -p /app/logs
 
+# ==================== 数据恢复 ====================
 # 跳过从 Dataset 恢复 config.yaml（由本脚本根据环境变量重新生成）
 export SKIP_CONFIG_RESTORE=true
 
-# 从 Dataset 恢复数据（如果配置了）
 if [ -n "$HF_DATASET_REPO" ]; then
     echo "📥 从 Dataset 恢复数据..."
     python -m src.data_sync restore || {
@@ -211,6 +213,12 @@ delegation:
   max_iterations: 50
   reasoning_effort: "medium"
 
+# API Server 配置 (Web UI BFF 的上游代理目标)
+api_server:
+  enabled: true
+  port: 8642
+  host: "127.0.0.1"
+
 # 终端配置
 terminal:
   backend: local
@@ -252,7 +260,6 @@ echo "   ✅ 配置文件已生成"
 # ==================== 导出供应商 Base URL 环境变量 ====================
 echo "🌐 设置供应商 Base URL 环境变量..."
 
-# 导出各供应商的 base_url，确保 Hermes 在 config check 时能识别
 if [ -n "$NVIDIA_API_KEY" ]; then
     export NVIDIA_BASE_URL="${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}"
 fi
@@ -269,10 +276,19 @@ if [ -n "$LONGCAT_API_KEY" ]; then
     export LONGCAT_BASE_URL="${LONGCAT_BASE_URL:-https://api.longcat.chat/openai}"
 fi
 
+# 导出 API Server 环境变量（确保 Gateway 以 API Server 模式启动）
+export API_SERVER_ENABLED=true
+export API_SERVER_PORT=8642
+export API_SERVER_HOST=127.0.0.1
+
+# 默认允许所有用户（Hugging Face Spaces 单用户场景，否则 Gateway 拒绝所有消息）
+export GATEWAY_ALLOW_ALL_USERS="${GATEWAY_ALLOW_ALL_USERS:-true}"
+
 # 导出 HERMES_MODEL 环境变量（进程级覆盖，影响 cron 等调度任务的模型选择）
 export HERMES_MODEL="$MAIN_MODEL"
 
 echo "   ✅ Base URL 环境变量已设置"
+echo "   ✅ API Server 环境变量已设置 (端口: 8642)"
 echo "   ✅ HERMES_MODEL=$HERMES_MODEL (进程级模型覆盖)"
 
 # ==================== 环境变量注入 ====================
@@ -290,22 +306,57 @@ PERSISTENT_VARS=(
     "GOOGLE_API_KEY" "GEMINI_API_KEY" "GEMINI_BASE_URL"
     "OPENROUTER_API_KEY" "OPENROUTER_BASE_URL"
     "LONGCAT_API_KEY" "LONGCAT_BASE_URL"
-    "TELEGRAM_BOT_TOKEN" "TELEGRAM_ALLOWED_USERS"
+    "API_SERVER_ENABLED" "API_SERVER_PORT" "API_SERVER_HOST"
+    "TELEGRAM_BOT_TOKEN" "TELEGRAM_ALLOWED_USERS" "TELEGRAM_PROXY"
     "DISCORD_BOT_TOKEN" "DISCORD_CLIENT_ID"
-    "SLACK_BOT_TOKEN" "SLACK_SIGNING_SECRET"
+    "SLACK_BOT_TOKEN" "SLACK_APP_TOKEN" "SLACK_SIGNING_SECRET"
     "WHATSAPP_BUSINESS_ID" "WHATSAPP_PHONE_NUMBER" "WHATSAPP_ACCESS_TOKEN"
+    "WEIXIN_ACCOUNT_ID" "WEIXIN_TOKEN" "WEIXIN_BASE_URL"
+    "GATEWAY_ALLOW_ALL_USERS"
+    "AUTH_TOKEN"
 )
 
-> "$ENV_FILE"
+# 合并策略：保留恢复的 .env 中由 BFF 等写入的变量（如 WEIXIN_ACCOUNT_ID/WEIXIN_TOKEN），
+# 同时用进程环境变量覆盖同名键（进程环境变量优先级更高）。
+# 这避免了 "先恢复再清空" 导致 BFF 写入的凭据丢失的问题。
+
+# 第1步：读取恢复的 .env 中所有现有键值对（跳过注释和空行）
+declare -A env_entries=()
+if [ -f "$ENV_FILE" ]; then
+    while IFS= read -r line; do
+        # 跳过注释和空行
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # 提取 KEY=VALUE
+        eq_idx="${line%%=*}"
+        if [ -n "$eq_idx" ] && [ "$eq_idx" != "$line" ]; then
+            env_entries["$eq_idx"]="$line"
+        fi
+    done < "$ENV_FILE"
+fi
+
+# 第2步：用进程环境变量覆盖/新增 PERSISTENT_VARS 中的键
 for var in "${PERSISTENT_VARS[@]}"; do
     if [ -n "${!var}" ]; then
-        echo "${var}=${!var}" >> "$ENV_FILE"
+        env_entries["$var"]="${var}=${!var}"
+    else
+        # 进程环境中没有该变量，但恢复的 .env 中可能有 → 保留恢复的值
+        # 如果恢复的 .env 中也没有，则不写入
+        :
     fi
 done
 
-echo "   ✅ 已写入 $(grep -c '=' "$ENV_FILE") 个环境变量"
+# 第3步：写入合并后的 .env
+{
+    for key in "${!env_entries[@]}"; do
+        echo "${env_entries[$key]}"
+    done
+} | sort > "$ENV_FILE"
 
-# ==================== 启动服务 ====================
+RESTORED_COUNT=$(grep -c '=' "$ENV_FILE")
+echo "   ✅ 已写入 ${RESTORED_COUNT} 个环境变量（含恢复的持久化变量）"
+
+# ==================== 启动数据同步服务 ====================
 SYNC_INTERVAL=${SYNC_INTERVAL:-60}
 echo "🔄 数据同步间隔: ${SYNC_INTERVAL}秒"
 
@@ -314,17 +365,13 @@ python -m src.data_sync daemon &
 SYNC_PID=$!
 echo "   同步服务 PID: $SYNC_PID"
 
+# ==================== 配置检查 + 模型锁定 ====================
 echo "🔄 检查配置..."
 hermes config check 2>/dev/null || echo "   配置检查完成"
 
-# ==================== 强制设置模型（防止 Hermes 启动时覆盖） ====================
-echo "🔒 强制写入模型配置（防止启动时被覆盖）..."
-# 使用 hermes config set 确保模型设置正确写入 config.yaml
-# 这一步很关键：Hermes 内部的 config bridge 可能在启动时自动检测 API Key
-# 并重新配置 provider/model，导致我们设置的模型被覆盖
+echo "🔒 强制写入模型配置（防止 Hermes 启动时被覆盖）..."
 hermes config set model.default "$MAIN_MODEL" 2>/dev/null || {
     echo "   ⚠️ hermes config set 不可用，使用直接写入方式"
-    # 备用方案：使用 yq 或 sed 直接修改 config.yaml 中的 model.default
     if command -v yq &>/dev/null; then
         yq -i ".model.default = \"$MAIN_MODEL\"" "$CONFIG_FILE"
     fi
@@ -346,67 +393,187 @@ fi
 
 echo "   ✅ 模型配置已锁定: $MAIN_PROVIDER/$MAIN_MODEL"
 
-echo "📡 检查并启动消息网关..."
-if [ -n "$TELEGRAM_BOT_TOKEN" ] || [ -n "$DISCORD_BOT_TOKEN" ]; then
-    echo "   启动网关..."
-    hermes gateway run &
-    GATEWAY_PID=$!
-    sleep 3
-    if kill -0 $GATEWAY_PID 2>/dev/null; then
-        echo "   ✅ 网关启动成功"
-    else
-        echo "   ⚠️ 网关可能启动失败"
+# ==================== 启动 Gateway (API Server + 消息平台) ====================
+echo "📡 启动 Hermes Gateway + API Server..."
+
+# Gateway PID 文件（用于追踪当前运行的 gateway 进程）
+GATEWAY_PIDFILE="/data/.hermes/gateway.pid"
+
+# Gateway 包装器：自动重启 + 崩溃恢复
+# 使用 --replace 避免端口冲突（BFF 偶尔也通过 hermes-cli.ts 调用 restartGateway）
+# 崩溃后等待 30 秒重启；正常退出不重启
+# BFF 保存 weixin 凭据后会调用 restartGateway()，该函数在 Docker 模式下
+# 会 kill 旧进程然后 spawn "hermes gateway run"，与本包装器可能竞争。
+# --replace 让 gateway 在检测到端口占用时自动替换旧进程，避免冲突。
+(
+    while true; do
+        hermes gateway run --replace 2>&1 | while IFS= read -r line; do
+            echo "$line"
+            case "$line" in
+                *"Gateway failed to connect"*)
+                    echo "   ⚠️ 网关消息平台连接失败，API Server 仍可使用，30 秒后重试..."
+                    ;;
+            esac
+        done
+        EXIT_CODE=${PIPESTATUS[0]}
+        if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "   ⚠️ 网关进程退出 (code=$EXIT_CODE)，30 秒后重启..."
+            sleep 30
+        else
+            echo "   🛑 网关正常退出（可能被 BFF restartGateway 替换）"
+            # 检查是否有新 gateway 进程在运行（BFF 可能已启动新进程）
+            sleep 5
+            if [ -f "$GATEWAY_PIDFILE" ]; then
+                NEW_PID=$(python3 -c "import json; print(json.load(open('$GATEWAY_PIDFILE')).get('pid',0))" 2>/dev/null || echo 0)
+                if [ "$NEW_PID" -gt 0 ] && kill -0 "$NEW_PID" 2>/dev/null; then
+                    echo "   🔄 检测到新网关进程 (PID: $NEW_PID)，等待其退出..."
+                    # 等待新进程退出后再继续循环
+                    while kill -0 "$NEW_PID" 2>/dev/null; do sleep 5; done
+                    echo "   ⚠️ 新网关进程已退出，30 秒后重启包装器..."
+                    sleep 30
+                    continue
+                fi
+            fi
+            echo "   🛑 无新网关进程，不再重启"
+            break
+        fi
+    done
+) &
+GATEWAY_PID=$!
+
+# 等待 API Server 就绪
+echo "   ⏳ 等待 API Server 就绪 (:8642)..."
+API_READY=false
+for i in $(seq 1 30); do
+    if curl -sf http://127.0.0.1:8642/health > /dev/null 2>&1; then
+        API_READY=true
+        break
     fi
+    sleep 1
+done
+
+if [ "$API_READY" = true ]; then
+    echo "   ✅ API Server 已就绪 (http://127.0.0.1:8642)"
+    # Gateway PID 文件由 Hermes 自己在 gateway run 启动时写入（gateway/run.py:write_pid_file）
+    # 通过 symlink /home/appuser/.hermes → /data/.hermes，BFF GatewayManager 可正确读取
 else
-    echo "   未检测到 Gateway 配置，仅运行 Web Dashboard"
+    echo "   ⚠️ API Server 未在 30 秒内就绪，继续启动 Web UI（API Server 可能稍后可用）"
+fi
+
+if kill -0 $GATEWAY_PID 2>/dev/null; then
+    echo "   ✅ 网关进程运行中 (PID: $GATEWAY_PID)"
+else
+    echo "   ⚠️ 网关进程已退出，仅 Web UI 可用"
 fi
 
 echo ""
 echo "💡 提示："
-echo "   - 在 WebUI Config 页面可查看完整配置"
-echo "   - Delegation 菜单可查看子代理模型"
-echo "   - Auxiliary 菜单可查看 vision/辅助模型"
+echo "   - Channels 页面可配置微信/飞书/企业微信等平台"
+echo "   - Models 页面可管理模型供应商"
+echo "   - Jobs 页面可管理定时任务"
 echo ""
+
+# ==================== Auth Token 处理 ====================
+echo "🔑 配置 Web UI 认证..."
+if [ -z "$AUTH_TOKEN" ]; then
+    # 尝试从持久化文件恢复
+    AUTH_TOKEN_FILE="/data/.hermes-web-ui/.token"
+    if [ -f "$AUTH_TOKEN_FILE" ]; then
+        AUTH_TOKEN=$(cat "$AUTH_TOKEN_FILE")
+        echo "   ✅ 已恢复 Web UI 认证 Token"
+    else
+        # 自动生成新 Token
+        AUTH_TOKEN=$(openssl rand -hex 16 2>/dev/null || head -c 32 /dev/urandom | xxd -p | head -c 32)
+        mkdir -p /data/.hermes-web-ui
+        echo "$AUTH_TOKEN" > "$AUTH_TOKEN_FILE"
+        echo ""
+        echo "   ╔══════════════════════════════════════════════════╗"
+        echo "   ║  🔑 Web UI 认证 Token (请保存！)                 ║"
+        echo "   ║  $AUTH_TOKEN"
+        echo "   ║                                                    ║"
+        echo "   ║  在 Web UI 登录页面输入此 Token                    ║"
+        echo "   ║  也可在 HF Spaces Settings 设置 AUTH_TOKEN 覆盖   ║"
+        echo "   ╚══════════════════════════════════════════════════╝"
+        echo ""
+    fi
+else
+    echo "   ✅ 使用环境变量中的 AUTH_TOKEN"
+fi
+export AUTH_TOKEN
+
+# ==================== 启动 Web UI (BFF Server) ====================
+echo "🌐 启动 Hermes Web UI..."
+echo "   BFF Server: http://0.0.0.0:7860"
+echo "   Upstream:   http://127.0.0.1:8642"
+echo ""
+
+# 确保运行时环境变量设置完毕
+export PORT=7860
+export UPSTREAM=http://127.0.0.1:8642
+export HERMES_BIN=/usr/local/bin/hermes
+export HERMES_HOME=/data/.hermes
 
 # 优雅关闭
 cleanup() {
     echo ""
     echo "🛑 执行清理..."
+
+    # 备份数据
+    if [ -n "$HF_DATASET_REPO" ]; then
+        echo "   💾 执行最终数据备份..."
+        python -m src.data_sync backup --force 2>/dev/null || echo "   ⚠️ 备份失败"
+    fi
+
+    # 停止各进程（顺序：BFF → Gateway → Sync）
+    if [ -n "$BFF_PID" ] && kill -0 $BFF_PID 2>/dev/null; then
+        echo "   🛑 停止 Web UI..."
+        kill $BFF_PID 2>/dev/null || true
+        wait $BFF_PID 2>/dev/null || true
+    fi
+    if [ -n "$GATEWAY_PID" ] && kill -0 $GATEWAY_PID 2>/dev/null; then
+        echo "   🛑 停止 Gateway..."
+        kill $GATEWAY_PID 2>/dev/null || true
+        wait $GATEWAY_PID 2>/dev/null || true
+    fi
     if kill -0 $SYNC_PID 2>/dev/null; then
+        echo "   🛑 停止数据同步..."
         kill $SYNC_PID 2>/dev/null || true
         wait $SYNC_PID 2>/dev/null || true
     fi
-    if [ -n "$DASHBOARD_PID" ] && kill -0 $DASHBOARD_PID 2>/dev/null; then
-        kill $DASHBOARD_PID 2>/dev/null || true
-        wait $DASHBOARD_PID 2>/dev/null || true
-    fi
-    if [ -n "$HF_DATASET_REPO" ]; then
-        python -m src.data_sync backup --force || echo "   备份失败"
-    fi
+
     echo "👋 再见！"
     exit 0
 }
 
 trap cleanup SIGTERM SIGINT
 
-echo "🌐 启动 Hermes Web Dashboard..."
-echo "   访问地址: http://localhost:7860"
-echo ""
+# 启动 BFF Server (替代 hermes dashboard)
+node /opt/hermes-web-ui/dist/server/index.js &
+BFF_PID=$!
 
-# 启动 Dashboard（后台），等待初始化后再次确认模型配置
-hermes dashboard --host 0.0.0.0 --port 7860 --no-open --insecure &
-DASHBOARD_PID=$!
+# 等待 BFF 就绪
+echo "   ⏳ 等待 Web UI 就绪..."
+BFF_READY=false
+for i in $(seq 1 20); do
+    if curl -sf http://localhost:7860/health > /dev/null 2>&1; then
+        BFF_READY=true
+        break
+    fi
+    sleep 1
+done
 
-# 等待 Dashboard 初始化完成
-echo "⏳ 等待 Dashboard 初始化..."
-sleep 5
+if [ "$BFF_READY" = true ]; then
+    echo "   ✅ Web UI 已就绪 → http://localhost:7860"
+else
+    echo "   ⚠️ Web UI 未在 20 秒内就绪，请查看日志"
+fi
 
-# 再次验证模型配置（Dashboard 启动可能触发 config bridge 修改）
+# 再次验证模型配置（BFF 启动可能修改 config.yaml）
 if [ -f "$CONFIG_FILE" ]; then
     if command -v yq &>/dev/null; then
         ACTUAL_MODEL=$(yq '.model.default' "$CONFIG_FILE" 2>/dev/null)
         if [ -n "$ACTUAL_MODEL" ] && [ "$ACTUAL_MODEL" != "$MAIN_MODEL" ] && [ "$ACTUAL_MODEL" != "null" ]; then
-            echo "   ⚠️ 检测到模型被 Dashboard 启动流程覆盖!"
+            echo "   ⚠️ 检测到模型被 BFF 启动流程覆盖!"
             echo "   📋 期望: $MAIN_MODEL, 实际: $ACTUAL_MODEL"
             echo "   🔒 重新写入正确的模型配置..."
             yq -i ".model.default = \"$MAIN_MODEL\"" "$CONFIG_FILE"
@@ -422,17 +589,8 @@ if [ -f "$CONFIG_FILE" ]; then
         else
             echo "   ✅ 模型配置验证通过: $MAIN_PROVIDER/$MAIN_MODEL"
         fi
-    else
-        # 没有 yq，使用 sed 做局部修改（仅修改 model.default 行）
-        if ! grep -q "default:.*$MAIN_MODEL" "$CONFIG_FILE" 2>/dev/null; then
-            echo "   ⚠️ 模型可能不匹配，使用 sed 修正..."
-            # 在 model: 块内替换 default 行
-            sed -i "/^model:/,/^[^ ]/ s/^[[:space:]]*default:.*/  default: \"$MAIN_MODEL\"/" "$CONFIG_FILE" 2>/dev/null || \
-            sed -i "s/default:.*/default: \"$MAIN_MODEL\"/" "$CONFIG_FILE" 2>/dev/null || \
-            echo "   ⚠️ 无法修改 config.yaml，请手动检查"
-        fi
     fi
 fi
 
-# 等待 Dashboard 进程
-wait $DASHBOARD_PID
+# 等待 BFF 主进程（前台阻塞，容器生命周期由 BFF 控制）
+wait $BFF_PID

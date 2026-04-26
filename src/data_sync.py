@@ -50,6 +50,7 @@ class DatasetManager:
             'state_db': self.hermes_home / 'state.db',
             'logs': self.hermes_home / 'logs',
             'cron': self.hermes_home / 'cron',
+            'webui_token': Path('/data/.hermes-web-ui') / '.token',
         }
         
     def validate(self) -> bool:
@@ -81,6 +82,7 @@ class DatasetManager:
         (self.temp_dir / 'state').mkdir()
         (self.temp_dir / 'logs').mkdir()
         (self.temp_dir / 'cron').mkdir()
+        (self.temp_dir / 'webui').mkdir()
         
         # 复制文件
         try:
@@ -124,10 +126,15 @@ class DatasetManager:
             if self.path_mapping['cron'].exists():
                 shutil.copytree(self.path_mapping['cron'], self.temp_dir / 'cron', dirs_exist_ok=True)
             
+            # WebUI 认证 Token
+            if self.path_mapping['webui_token'].exists():
+                (self.temp_dir / 'webui').mkdir(exist_ok=True)
+                shutil.copy2(self.path_mapping['webui_token'], self.temp_dir / 'webui' / '.token')
+            
             # 添加元数据
             metadata = {
                 'timestamp': datetime.now().isoformat(),
-                'version': '0.9.0',
+                'version': '0.10.0',
                 'hermes_home': str(self.hermes_home)
             }
             with open(self.temp_dir / 'metadata.json', 'w') as f:
@@ -215,6 +222,7 @@ class DatasetManager:
             'state/state.db': self.path_mapping['state_db'],
             'logs': self.path_mapping['logs'],
             'cron': self.path_mapping['cron'],
+            'webui/.token': self.path_mapping['webui_token'],
         }
         
         # 仅在明确要求时恢复 config.yaml（默认跳过）
@@ -254,14 +262,27 @@ class DatasetManager:
 class ConfigFileHandler(FileSystemEventHandler):
     """配置文件变化处理器 - 实时同步到 Dataset 并触发重载"""
     
+    # 启动静默期（秒）：在此期间内的文件变更不予备份，避免启动阶段冗余上传
+    STARTUP_GRACE_PERIOD = 30
+    
     def __init__(self, manager: DatasetManager):
         self.manager = manager
         self.last_backup_time = 0
         self.backup_cooldown = 5  # 5秒内不重复备份
+        self.start_time = time.time()  # 记录处理器创建时间
+        self._startup_logged = False
         
     def on_modified(self, event):
         """文件被修改时触发"""
         if event.is_directory:
+            return
+        
+        # 启动静默期：跳过启动阶段的配置变更备份
+        elapsed = time.time() - self.start_time
+        if elapsed < self.STARTUP_GRACE_PERIOD:
+            if not self._startup_logged:
+                logger.info(f"In startup grace period ({int(self.STARTUP_GRACE_PERIOD - elapsed)}s remaining), skipping backup for: {event.src_path}")
+                self._startup_logged = True
             return
             
         # 只关注关键配置文件

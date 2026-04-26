@@ -55,6 +55,12 @@ delegation:
   max_iterations: 50
   reasoning_effort: "medium"
 
+# API Server 配置 (Web UI BFF 的上游代理目标)
+api_server:
+  enabled: true
+  port: 8642
+  host: "127.0.0.1"
+
 # 终端配置
 terminal:
   backend: local
