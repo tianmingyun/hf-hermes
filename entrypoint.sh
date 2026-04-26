@@ -257,6 +257,76 @@ EOF
 
 echo "   ✅ 配置文件已生成"
 
+# ==================== 合并用户配置（平台/channel 设置等） ====================
+# 如果存在从 Dataset 恢复的 config.yaml.restored，将其中的用户修改区块合并到新生成的 config.yaml
+# 合并策略：
+#   - entrypoint.sh 控制的区块（model, auxiliary, delegation, api_server）：新生成的优先
+#     （这些由 HF Spaces 环境变量决定，必须权威）
+#   - 用户在 Web UI 中修改的区块（platforms, display, agent, memory, compression, cron, terminal）：
+#     恢复的优先（保留用户的个性化设置，如 channel 行为、显示偏好等）
+RESTORED_CONFIG="/data/.hermes/config.yaml.restored"
+if [ -f "$RESTORED_CONFIG" ]; then
+    echo "🔄 合并用户配置 (platforms, display, agent 等)..."
+    python3 << 'MERGE_SCRIPT'
+import yaml
+import sys
+
+GENERATED = '/data/.hermes/config.yaml'
+RESTORED = '/data/.hermes/config.yaml.restored'
+
+# 区块优先级定义：
+# ENTRYPOINT_PRIORITY  → entrypoint.sh 生成的值优先（由 HF Spaces 环境变量控制）
+# USER_PRIORITY        → 恢复的用户值优先（Web UI 中用户修改的偏好）
+ENTRYPOINT_PRIORITY = {'model', 'auxiliary', 'delegation', 'api_server'}
+USER_PRIORITY = {'platforms', 'display', 'agent', 'memory', 'compression', 'cron', 'terminal'}
+
+try:
+    with open(GENERATED) as f:
+        generated = yaml.safe_load(f) or {}
+    with open(RESTORED) as f:
+        restored = yaml.safe_load(f) or {}
+
+    merged = {}
+
+    # 遍历所有出现在任一配置中的顶层键
+    all_keys = set(list(generated.keys()) + list(restored.keys()))
+
+    for key in all_keys:
+        if key in ENTRYPOINT_PRIORITY:
+            # 环境变量控制的区块：始终用新生成的值
+            if key in generated:
+                merged[key] = generated[key]
+        elif key in USER_PRIORITY:
+            # 用户偏好区块：优先用恢复的值，没有则用生成的默认值
+            if key in restored:
+                merged[key] = restored[key]
+            elif key in generated:
+                merged[key] = generated[key]
+        else:
+            # 未明确分类的区块：优先用恢复的值（保留用户可能做的修改）
+            if key in restored:
+                merged[key] = restored[key]
+            elif key in generated:
+                merged[key] = generated[key]
+
+    with open(GENERATED, 'w') as f:
+        yaml.dump(merged, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    # 统计合并了哪些区块
+    merged_user_keys = [k for k in USER_PRIORITY if k in restored]
+    merged_other_keys = [k for k in all_keys - ENTRYPOINT_PRIORITY - USER_PRIORITY if k in restored and k not in generated]
+    print(f"   ✅ 已合并用户区块: {', '.join(merged_user_keys) if merged_user_keys else '无'}")
+
+except Exception as e:
+    print(f"   ⚠️ 合并配置失败: {e}，使用生成的默认配置")
+    sys.exit(0)  # 不阻止启动
+MERGE_SCRIPT
+    # 合并完成后删除临时文件，避免被后续备份重复保存
+    rm -f "$RESTORED_CONFIG"
+else
+    echo "   ℹ️ 无需合并（无恢复的用户配置）"
+fi
+
 # ==================== 导出供应商 Base URL 环境变量 ====================
 echo "🌐 设置供应商 Base URL 环境变量..."
 
