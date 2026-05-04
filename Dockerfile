@@ -40,6 +40,29 @@ RUN ARCH=$(dpkg --print-architecture) \
     && node --version \
     && npm --version
 
+# ==================== Bun Runtime ====================
+# baoyu-skills 需要 bun 运行时
+# 安装到 /usr/local/bin 以便所有用户（包括 appuser）都能访问
+RUN echo "Installing Bun runtime" \
+    && curl -fsSL https://bun.sh/install | bash \
+    && export PATH="$PATH:/root/.bun/bin" \
+    && bun --version \
+    && cp /root/.bun/bin/bun /usr/local/bin/bun \
+    && chmod +x /usr/local/bin/bun
+
+# bun 必须在运行时 PATH 中可用（agent 子进程通过 bun 调用 baoyu-skills）
+# /usr/local/bin 已在默认 PATH 中，所有用户均可访问
+
+# ==================== baoyu-skills 脚本预置 ====================
+# 将完整的 baoyu-imagine 脚本预置到 ~/.baoyu-skills/ 目录
+# 此目录是 main.ts loadExtendConfig() 的查找路径之一
+# 避免依赖 Web UI 技能安装（可能只下载编译产物而丢失 .ts 源文件）
+RUN mkdir -p /home/appuser/.baoyu-skills/baoyu-imagine && \
+    git clone --depth 1 https://github.com/JimLiu/baoyu-skills.git /tmp/baoyu-skills && \
+    cp -r /tmp/baoyu-skills/skills/baoyu-imagine/scripts \
+          /home/appuser/.baoyu-skills/baoyu-imagine/scripts && \
+    rm -rf /tmp/baoyu-skills
+
 # ==================== 工具安装 ====================
 # yq: 运行时修改 config.yaml
 RUN curl -sL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/bin/yq && \
@@ -75,16 +98,19 @@ WORKDIR /app
 
 COPY src/ /app/src/
 COPY entrypoint.sh /app/
+COPY image-proxy.js /app/
+COPY image-gen-siliconflow.ts /app/
 COPY config/config.yaml /data/.hermes/config.yaml
 
 # 创建数据目录
-RUN mkdir -p /data/.hermes /data/.hermes-web-ui /app/logs && \
+RUN mkdir -p /data/.hermes /data/.hermes-web-ui /app/logs /home/appuser/.hermes-web-ui/logs && \
     chmod +x /app/entrypoint.sh
 
 # 设置非 root 用户（Hugging Face Spaces 要求）
 RUN useradd -m -u 1000 appuser && \
     ln -sf /data/.hermes /home/appuser/.hermes && \
-    chown -R appuser:appuser /data /opt/hermes-web-ui /app
+    mkdir -p /home/appuser/.cache && \
+    chown -R appuser:appuser /data /opt/hermes-web-ui /app /home/appuser
 
 USER appuser
 

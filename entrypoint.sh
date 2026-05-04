@@ -13,6 +13,10 @@ set -e
 echo "🚀 Hermes Agent v0.10.0 - Hugging Face Spaces"
 echo "=============================================="
 
+# 确保 bun 在 PATH 中（baoyu-skills 子进程需要）
+# bun 已安装在 /usr/local/bin（全局可访问），/home/appuser/.local/bin 用于 wrapper 脚本
+export PATH="$PATH:/usr/local/bin:/home/appuser/.local/bin"
+
 # 检查必要的环境变量
 if [ -z "$HF_DATASET_REPO" ]; then
     echo "⚠️  警告: HF_DATASET_REPO 未设置，数据将不会持久化到 Dataset"
@@ -23,6 +27,12 @@ echo "📁 初始化目录结构..."
 mkdir -p /data/.hermes/{cron,sessions,logs,memories,skills,pairing,hooks,image_cache,audio_cache,whatsapp/session}
 mkdir -p /data/.hermes-web-ui
 mkdir -p /app/logs
+
+echo "🔍 调试：初始化目录结构后检查"
+pwd
+ls -al /data/
+ls -al /data/.hermes/
+ls -al /data/.hermes/skills/
 
 # ==================== 数据恢复 ====================
 # 跳过从 Dataset 恢复 config.yaml（由本脚本根据环境变量重新生成）
@@ -224,6 +234,14 @@ terminal:
   backend: local
   timeout: 300
   shell: /bin/bash
+  # 允许 baoyu-skills 使用的 API Key 传递到子进程
+  # (Hermes 默认会过滤包含 KEY/TOKEN/SECRET 的环境变量)
+  env_passthrough:
+    - GEMINI_API_KEY
+    - GOOGLE_API_KEY
+    - SILICONFLOW_API_KEY
+    - GOOGLE_IMAGE_MODEL
+    - GOOGLE_BASE_URL
 
 # 显示配置
 display:
@@ -357,6 +375,25 @@ export GATEWAY_ALLOW_ALL_USERS="${GATEWAY_ALLOW_ALL_USERS:-true}"
 # 导出 HERMES_MODEL 环境变量（进程级覆盖，影响 cron 等调度任务的模型选择）
 export HERMES_MODEL="$MAIN_MODEL"
 
+# 导出图像生成所需的环境变量（确保 baoyu-imagine 技能能检测到）
+if [ -n "$SILICONFLOW_API_KEY" ]; then
+    export SILICONFLOW_API_KEY
+    export SILICONFLOW_BASE_URL="${SILICONFLOW_BASE_URL:-https://api.siliconflow.cn/v1}"
+    echo "   ✅ SILICONFLOW_API_KEY 已导出（baoyu-imagine 技能可用）"
+fi
+
+if [ -n "$GEMINI_API_KEY" ]; then
+    export GEMINI_API_KEY
+    export GEMINI_BASE_URL="${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com}"
+    # baoyu-imagine 的 google provider 使用 GOOGLE_API_KEY
+    export GOOGLE_API_KEY="${GEMINI_API_KEY}"
+    export GOOGLE_BASE_URL="${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com}"
+    export GOOGLE_IMAGE_MODEL="gemini-3.1-flash-image-preview"
+    echo "   ✅ GEMINI_API_KEY 已导出（baoyu-imagine 技能可用）"
+    echo "   ✅ GOOGLE_API_KEY 已设置（baoyu-imagine google provider）"
+    echo "   ✅ GOOGLE_IMAGE_MODEL=gemini-3.1-flash-image-preview"
+fi
+
 echo "   ✅ Base URL 环境变量已设置"
 echo "   ✅ API Server 环境变量已设置 (端口: 8642)"
 echo "   ✅ HERMES_MODEL=$HERMES_MODEL (进程级模型覆盖)"
@@ -425,6 +462,523 @@ done
 
 RESTORED_COUNT=$(grep -c '=' "$ENV_FILE")
 echo "   ✅ 已写入 ${RESTORED_COUNT} 个环境变量（含恢复的持久化变量）"
+
+# ==================== 配置 baoyu-skills 技能 (EXTEND.md) ====================
+# baoyu-imagine / baoyu-cover-image / baoyu-article-illustrator 的 EXTEND.md
+# 路径规范: $HOME/.baoyu-skills/<skill-name>/EXTEND.md
+# (注意: .baoyu-skills 有连字符, 不是 .baoyu/skills)
+# main.ts loadExtendConfig() 查找顺序: {cwd}/.baoyu-skills/ > $XDG_CONFIG_HOME > $HOME/.baoyu-skills/
+BAOYU_SKILLS_BASE="/home/appuser/.baoyu-skills"
+
+# --- baoyu-imagine (图像生成后端) ---
+IMAGINE_EXTEND_DIR="${BAOYU_SKILLS_BASE}/baoyu-imagine"
+IMAGINE_EXTEND_FILE="${IMAGINE_EXTEND_DIR}/EXTEND.md"
+
+if [ -n "$SILICONFLOW_API_KEY" ] || [ -n "$GEMINI_API_KEY" ]; then
+    echo "⚙️  配置 baoyu-imagine 技能..."
+    mkdir -p "${IMAGINE_EXTEND_DIR}"
+    
+    if [ -n "$GEMINI_API_KEY" ]; then
+        # Gemini 作为主供应商（图像质量更好）
+        # SiliconFlow 作为备用（在 wrapper 脚本中实现 fallback）
+        cat > "${IMAGINE_EXTEND_FILE}" << EOF_IMAGINE
+# Baoyu Imagine Configuration
+
+# 默认供应商 (Google/Gemini)
+default_provider = "google"
+
+# 默认质量
+default_quality = "2k"
+
+# 默认宽高比
+default_aspect_ratio = "16:9"
+
+# 默认图片尺寸 (Google 使用 1K/2K/4K)
+default_image_size = "2K"
+
+# Google/Gemini 供应商配置
+[default_model.google]
+provider = "google"
+model = "gemini-3.1-flash-image-preview"
+
+# 批量设置
+[batch]
+max_workers = 4
+EOF_IMAGINE
+        echo "   ✅ baoyu-imagine EXTEND.md 已写入 (Gemini 主供应商)"
+        
+        # 同时导出 SiliconFlow 配置到 EXTEND.md（备用）
+        if [ -n "$SILICONFLOW_API_KEY" ]; then
+            echo "   🔄 SiliconFlow 已配置为备用供应商"
+        fi
+    elif [ -n "$SILICONFLOW_API_KEY" ]; then
+        # 仅 SiliconFlow
+        cat > "${IMAGINE_EXTEND_FILE}" << EOF_IMAGINE
+# Baoyu Imagine Configuration
+
+# 默认供应商
+default_provider = "siliconflow"
+
+# 默认质量
+default_quality = "2k"
+
+# 默认宽高比
+default_aspect_ratio = "16:9"
+
+# 默认图片尺寸
+default_image_size = "1024x1024"
+
+# SiliconFlow 供应商配置
+[default_model.siliconflow]
+provider = "siliconflow"
+model = "Kwai-Kolors/Kolors"
+
+# 批量设置
+[batch]
+max_workers = 4
+EOF_IMAGINE
+        echo "   ✅ baoyu-imagine EXTEND.md 已写入 (SiliconFlow 后端)"
+    fi
+    
+    # 生成 ~/.baoyu-skills/.env 文件（绕过 Hermes 环境变量过滤）
+    # Hermes 的 terminal 子进程会过滤包含 KEY/TOKEN/SECRET 的环境变量
+    # baoyu-imagine 的 main.ts 会自动加载 ~/.baoyu-skills/.env
+    BAOYU_ENV_FILE="${BAOYU_SKILLS_BASE}/.env"
+    echo "   📝 生成 baoyu-skills .env 文件..."
+    > "${BAOYU_ENV_FILE}"
+    if [ -n "$GEMINI_API_KEY" ]; then
+        echo "GEMINI_API_KEY=${GEMINI_API_KEY}" >> "${BAOYU_ENV_FILE}"
+        echo "GOOGLE_API_KEY=${GEMINI_API_KEY}" >> "${BAOYU_ENV_FILE}"
+        echo "GOOGLE_IMAGE_MODEL=gemini-3.1-flash-image-preview" >> "${BAOYU_ENV_FILE}"
+        echo "GOOGLE_BASE_URL=${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com}" >> "${BAOYU_ENV_FILE}"
+    fi
+    if [ -n "$SILICONFLOW_API_KEY" ]; then
+        echo "SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY}" >> "${BAOYU_ENV_FILE}"
+    fi
+    echo "   ✅ .env 文件已写入 (${BAOYU_ENV_FILE})"
+else
+    echo "   ℹ️ 未配置 SILICONFLOW_API_KEY 或 GEMINI_API_KEY，跳过 baoyu-imagine 技能配置"
+fi
+
+# --- baoyu-cover-image (封面图生成) ---
+COVER_EXTEND_DIR="${BAOYU_SKILLS_BASE}/baoyu-cover-image"
+COVER_EXTEND_FILE="${COVER_EXTEND_DIR}/EXTEND.md"
+
+if [ -n "$SILICONFLOW_API_KEY" ] || [ -n "$GEMINI_API_KEY" ]; then
+    echo "⚙️  配置 baoyu-cover-image 技能..."
+    mkdir -p "${COVER_EXTEND_DIR}"
+    cat > "${COVER_EXTEND_FILE}" << EOF_COVER
+# Baoyu Cover Image Configuration
+
+# 首选图像后端
+preferred_image_backend = "baoyu-imagine"
+
+# 默认输出目录 (图片保存到哪里)
+# independent = cover-image/{topic-slug}/
+# imgs-subdir = {article-dir}/imgs/
+# same-dir = {article-dir}/
+# 使用 independent，图片会保存到 /data/cover-image/{topic-slug}/
+# image-proxy.js 已配置扫描此目录
+default_output_dir = "independent"
+
+# 默认宽高比
+default_aspect = "16:9"
+
+# 默认类型与风格
+preferred_type = "scene"
+preferred_palette = "warm"
+preferred_rendering = "digital"
+preferred_font = "clean"
+
+# 语言
+language = "zh"
+EOF_COVER
+    echo "   ✅ baoyu-cover-image EXTEND.md 已写入 (${COVER_EXTEND_FILE})"
+fi
+
+# --- baoyu-article-illustrator (文章配图) ---
+ILLUSTRATOR_EXTEND_DIR="${BAOYU_SKILLS_BASE}/baoyu-article-illustrator"
+ILLUSTRATOR_EXTEND_FILE="${ILLUSTRATOR_EXTEND_DIR}/EXTEND.md"
+
+if [ -n "$SILICONFLOW_API_KEY" ] || [ -n "$GEMINI_API_KEY" ]; then
+    echo "⚙️  配置 baoyu-article-illustrator 技能..."
+    mkdir -p "${ILLUSTRATOR_EXTEND_DIR}"
+    cat > "${ILLUSTRATOR_EXTEND_FILE}" << EOF_ILLUSTRATOR
+# Baoyu Article Illustrator Configuration
+
+# 首选图像后端
+preferred_image_backend = "baoyu-imagine"
+
+# 默认输出目录
+default_output_dir = "imgs-subdir"
+
+# 默认类型与风格
+preferred_type = "infographic"
+preferred_style = "minimal-flat"
+preferred_palette = "warm"
+
+# 语言
+language = "zh"
+EOF_ILLUSTRATOR
+    echo "   ✅ baoyu-article-illustrator EXTEND.md 已写入 (${ILLUSTRATOR_EXTEND_FILE})"
+fi
+
+# --- 调试: 验证 EXTEND.md 文件 ---
+if [ -n "$SILICONFLOW_API_KEY" ] || [ -n "$GEMINI_API_KEY" ]; then
+    echo "🔍 调试：验证 baoyu-skills EXTEND.md 文件"
+    ls -la "${BAOYU_SKILLS_BASE}/" 2>/dev/null || echo "   ⚠️ ${BAOYU_SKILLS_BASE} 不存在"
+    for skill_dir in "${BAOYU_SKILLS_BASE}"/*/; do
+        if [ -f "${skill_dir}EXTEND.md" ]; then
+            echo "   ✅ ${skill_dir}EXTEND.md 存在"
+            # 显示 provider 配置（用于诊断）
+            grep -E "^(default_provider|preferred_image_backend)" "${skill_dir}EXTEND.md" 2>/dev/null || true
+        else
+            echo "   ⚠️ ${skill_dir}EXTEND.md 缺失"
+        fi
+    done
+fi
+
+# ==================== 修复 baoyu-imagine 技能脚本缺失问题 ====================
+# Hermes Skills Hub 安装 baoyu-imagine 时只下载了 SKILL.md 和 references
+# 缺少 scripts/ 目录和 package.json，导致 agent 无法调用 bun scripts/main.ts
+# 修复方案：将 Dockerfile 构建时预置的完整脚本复制到 skills 目录
+# 如果 Dockerfile 预置失败（网络/缓存问题），则运行时下载
+
+SKILL_IMAGINE_DIR="/data/.hermes/skills/baoyu-imagine"
+SKILL_IMAGINE_SCRIPTS="${SKILL_IMAGINE_DIR}/scripts"
+BUILTIN_IMAGINE_SCRIPTS="${BAOYU_SKILLS_BASE}/baoyu-imagine/scripts"
+
+# 调试：显示脚本源状态
+echo "🔍 调试：检查 baoyu-imagine 脚本源..."
+echo "   内置脚本路径: ${BUILTIN_IMAGINE_SCRIPTS}"
+if [ -d "$BUILTIN_IMAGINE_SCRIPTS" ]; then
+    echo "   ✅ 内置脚本目录存在"
+    ls -la "${BUILTIN_IMAGINE_SCRIPTS}/" 2>/dev/null | head -5 || echo "   ⚠️ 无法列出内置脚本内容"
+else
+    echo "   ⚠️ 内置脚本目录不存在（Dockerfile 构建时可能下载失败）"
+fi
+echo "   目标脚本路径: ${SKILL_IMAGINE_SCRIPTS}"
+if [ -f "${SKILL_IMAGINE_SCRIPTS}/main.ts" ]; then
+    echo "   ✅ 目标脚本已存在"
+else
+    echo "   ⚠️ 目标脚本缺失"
+fi
+
+# 主修复逻辑
+if [ -n "$GEMINI_API_KEY" ]; then
+    echo "⚙️  修复 baoyu-imagine 技能脚本..."
+    
+    # 1. 确保 skills 目录存在
+    mkdir -p "${SKILL_IMAGINE_DIR}"
+    
+    # 2. 获取脚本（强制使用最新原始版本）
+    # 注意：Dataset 恢复可能包含旧版本（Pollinations/SiliconFlow 特化版）
+    # 必须重新下载原始 baoyu-skills 脚本以确保配置系统正常工作
+    # 先删除可能存在的只读旧版本（chmod 555 导致 cp -r 无法覆盖）
+    if [ -d "$BUILTIN_IMAGINE_SCRIPTS" ] && [ -f "${BUILTIN_IMAGINE_SCRIPTS}/main.ts" ]; then
+        echo "   📁 从内置目录复制 scripts/..."
+        rm -rf "${SKILL_IMAGINE_DIR}/scripts" 2>/dev/null || true
+        cp -r "${BUILTIN_IMAGINE_SCRIPTS}" "${SKILL_IMAGINE_DIR}/"
+    else
+        echo "   📥 内置脚本不可用，运行时下载..."
+        # 强制重新下载，忽略 Dataset 恢复的旧版本
+        rm -rf "${SKILL_IMAGINE_SCRIPTS}"
+        mkdir -p "${SKILL_IMAGINE_SCRIPTS}"
+        TEMP_SKILLS_DIR="/tmp/baoyu-skills-download"
+        rm -rf "$TEMP_SKILLS_DIR"
+        if git clone --depth 1 https://github.com/JimLiu/baoyu-skills.git "$TEMP_SKILLS_DIR" 2>/dev/null; then
+            if [ -f "${TEMP_SKILLS_DIR}/skills/baoyu-imagine/scripts/main.ts" ]; then
+                cp -r "${TEMP_SKILLS_DIR}/skills/baoyu-imagine/scripts/" "${SKILL_IMAGINE_DIR}/"
+                echo "   ✅ 运行时下载成功（原始完整版本）"
+            else
+                echo "   ❌ 下载的仓库中找不到 main.ts"
+            fi
+            rm -rf "$TEMP_SKILLS_DIR"
+        else
+            echo "   ❌ git clone 失败，请检查网络连接"
+            echo "   ⚠️  使用现有脚本（可能不是原始版本）"
+        fi
+    fi
+    
+    # 3. 创建 package.json（如果不存在）
+    if [ ! -f "${SKILL_IMAGINE_DIR}/package.json" ]; then
+        echo "   📝 创建 package.json..."
+        cat > "${SKILL_IMAGINE_DIR}/package.json" << 'EOF_PKG'
+{
+  "name": "baoyu-imagine",
+  "version": "1.58.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/node": "^22.14.0"
+  }
+}
+EOF_PKG
+    fi
+    
+    # 4. 修复 google.ts 的 generateWithGemini 和 extractInlineImageData 函数
+    # 修复1: responseModalities 从 ["IMAGE"] 改为 ["TEXT", "IMAGE"]
+    # 修复2: extractInlineImageData 支持 inline_data 字段（snake_case）
+    echo "   🔧 修复 google.ts 以支持 Google API 响应格式..."
+    if [ -f "${SKILL_IMAGINE_DIR}/scripts/providers/google.ts" ]; then
+        node -e "
+            const fs = require('fs');
+            const filePath = '${SKILL_IMAGINE_DIR}/scripts/providers/google.ts';
+            let content = fs.readFileSync(filePath, 'utf8');
+            let modified = false;
+            
+            // 修复1: responseModalities
+            if (content.includes('responseModalities: [\"IMAGE\"],')) {
+                content = content.replace(/responseModalities: \\[\"IMAGE\"\\],/g, 'responseModalities: [\"TEXT\", \"IMAGE\"],');
+                console.log('   ✅ 已修复 responseModalities: [\"TEXT\", \"IMAGE\"]');
+                modified = true;
+            }
+            
+            // 修复2: extractInlineImageData 支持 inline_data 字段
+            const oldLine = '      const data = part.inlineData?.data;';
+            const newLine = '      const data = part.inlineData?.data ?? part.inline_data?.data;';
+            if (content.includes(oldLine)) {
+                content = content.replace(oldLine, newLine);
+                console.log('   ✅ 已修复 extractInlineImageData 函数');
+                modified = true;
+            }
+            
+            if (modified) {
+                fs.writeFileSync(filePath, content, 'utf8');
+                console.log('   ✅ 所有修复应用完成');
+            } else {
+                console.log('   ⚠️  未找到需要修复的代码');
+            }
+        "
+    fi
+    
+    # 5. 安装依赖（如果 node_modules 不存在）
+    if [ ! -d "${SKILL_IMAGINE_DIR}/node_modules" ]; then
+        echo "   📦 安装 baoyu-imagine 依赖..."
+        (cd "${SKILL_IMAGINE_DIR}" && bun install) 2>&1 | tail -5 || {
+            echo "   ⚠️  bun install 失败，尝试 npm install..."
+            (cd "${SKILL_IMAGINE_DIR}" && npm install) 2>&1 | tail -5 || true
+        }
+    fi
+    
+    # 5. 最终验证（强检查）
+    echo "   🔍 验证脚本完整性..."
+    if [ -f "${SKILL_IMAGINE_SCRIPTS}/main.ts" ]; then
+        echo "   ✅ baoyu-imagine 技能已就绪"
+        echo "      脚本: ${SKILL_IMAGINE_SCRIPTS}/main.ts"
+        ls -lh "${SKILL_IMAGINE_SCRIPTS}/main.ts"
+        if [ -d "${SKILL_IMAGINE_DIR}/node_modules" ]; then
+            echo "      依赖: 已安装 (${SKILL_IMAGINE_DIR}/node_modules)"
+        else
+            echo "      ⚠️ 依赖: 未安装"
+        fi
+    else
+        echo "   ❌ baoyu-imagine 技能修复失败: main.ts 仍然缺失"
+        echo "      这通常是因为网络问题导致无法下载脚本"
+    fi
+    
+    # 6. 检测可用的图像生成后端并配置
+    # 优先级: gemini > siliconflow
+    # Gemini 图像质量更好，SiliconFlow 作为备用（国内稳定）
+    if [ -n "$GEMINI_API_KEY" ]; then
+        echo "   🎯 检测到 GEMINI_API_KEY，启用 Gemini 主供应商..."
+        echo "      模型: gemini-3.1-flash-image-preview"
+        
+        # 恢复原始 main.ts（支持 google provider）
+        # 如果之前被 siliconflow 版本替换，从备份恢复
+        if [ -f "${SKILL_IMAGINE_SCRIPTS}/main.ts.orig" ]; then
+            cp "${SKILL_IMAGINE_SCRIPTS}/main.ts.orig" "${SKILL_IMAGINE_SCRIPTS}/main.ts"
+            echo "   ✅ 已恢复原始 main.ts（支持 google provider）"
+        fi
+        
+        # 创建智能包装脚本
+        WRAPPER_DIR="/home/appuser/.local/bin"
+        mkdir -p "$WRAPPER_DIR"
+        
+        if [ -n "$SILICONFLOW_API_KEY" ]; then
+            # 双供应商：Gemini 主 + SiliconFlow 备
+            # 使用双引号 heredoc 以展开 SKILL_IMAGINE_SCRIPTS 变量
+            cat > "${WRAPPER_DIR}/baoyu-imagine" << EOF_WRAPPER
+#!/bin/bash
+# Smart wrapper: Gemini primary, SiliconFlow fallback
+
+# 加载 baoyu-skills .env 文件（绕过 Hermes 环境变量过滤）
+if [ -f ~/.baoyu-skills/.env ]; then
+    set -a
+    source ~/.baoyu-skills/.env
+    set +a
+fi
+
+# 同时尝试从环境变量加载（如果未被过滤）
+export GEMINI_API_KEY="\${GEMINI_API_KEY:-\$GEMINI_API_KEY}"
+export GOOGLE_API_KEY="\${GOOGLE_API_KEY:-\$GEMINI_API_KEY}"
+export GOOGLE_IMAGE_MODEL="\${GOOGLE_IMAGE_MODEL:-gemini-3.1-flash-image-preview}"
+export GOOGLE_BASE_URL="\${GOOGLE_BASE_URL:-https://generativelanguage.googleapis.com}"
+export SILICONFLOW_API_KEY="\${SILICONFLOW_API_KEY:-\$SILICONFLOW_API_KEY}"
+
+# 确保图片保存到可访问的目录
+mkdir -p /data/.hermes/image_cache
+cd /data/.hermes/image_cache
+
+# 尝试 Gemini 主供应商
+# baoyu-imagine 的 google provider 会自动使用 GOOGLE_IMAGE_MODEL
+echo "🎯 Trying Gemini (gemini-3.1-flash-image-preview)..."
+if bun "${SKILL_IMAGINE_SCRIPTS}/main.ts" "\$@" 2>/tmp/gemini_error.log; then
+    exit 0
+fi
+
+# Fallback 到 SiliconFlow
+echo "⚠️  Gemini failed, falling back to SiliconFlow (Kwai-Kolors/Kolors)..."
+if [ -f "/app/image-gen-siliconflow.ts" ]; then
+    exec bun "/app/image-gen-siliconflow.ts" --model "Kwai-Kolors/Kolors" "\$@"
+else
+    echo "❌ SiliconFlow fallback script not found"
+    cat /tmp/gemini_error.log >&2
+    exit 1
+fi
+EOF_WRAPPER
+            echo "   ✅ 智能包装脚本: ${WRAPPER_DIR}/baoyu-imagine (Gemini主 + SiliconFlow备)"
+        else
+            # 仅 Gemini
+            cat > "${WRAPPER_DIR}/baoyu-imagine" << EOF_WRAPPER
+#!/bin/bash
+# Gemini-only wrapper
+
+# 加载 baoyu-skills .env 文件（绕过 Hermes 环境变量过滤）
+if [ -f ~/.baoyu-skills/.env ]; then
+    set -a
+    source ~/.baoyu-skills/.env
+    set +a
+fi
+
+# 同时尝试从环境变量加载（如果未被过滤）
+export GEMINI_API_KEY="\${GEMINI_API_KEY:-\$GEMINI_API_KEY}"
+export GOOGLE_API_KEY="\${GOOGLE_API_KEY:-\$GEMINI_API_KEY}"
+export GOOGLE_IMAGE_MODEL="\${GOOGLE_IMAGE_MODEL:-gemini-3.1-flash-image-preview}"
+export GOOGLE_BASE_URL="\${GOOGLE_BASE_URL:-https://generativelanguage.googleapis.com}"
+
+mkdir -p /data/.hermes/image_cache
+cd /data/.hermes/image_cache
+
+exec bun "${SKILL_IMAGINE_SCRIPTS}/main.ts" "\$@"
+EOF_WRAPPER
+            echo "   ✅ 包装脚本: ${WRAPPER_DIR}/baoyu-imagine (仅 Gemini)"
+        fi
+        chmod +x "${WRAPPER_DIR}/baoyu-imagine"
+        
+    elif [ -n "$SILICONFLOW_API_KEY" ]; then
+        echo "   🎯 检测到 SILICONFLOW_API_KEY，启用 SiliconFlow 后端..."
+        
+        # 备份原始 main.ts
+        if [ ! -f "${SKILL_IMAGINE_SCRIPTS}/main.ts.orig" ]; then
+            cp "${SKILL_IMAGINE_SCRIPTS}/main.ts" "${SKILL_IMAGINE_SCRIPTS}/main.ts.orig"
+        fi
+        
+        # 使用增强版 SiliconFlow 生成器（支持风格/尺寸/品质参数）
+        ENHANCED_GEN="/app/image-gen-siliconflow.ts"
+        if [ -f "$ENHANCED_GEN" ]; then
+            cp "$ENHANCED_GEN" "${SKILL_IMAGINE_SCRIPTS}/main.ts"
+            echo "   ✅ 已复制增强版生成器 (${ENHANCED_GEN})"
+        else
+            echo "   ⚠️ 增强版生成器不存在，使用内联简化版..."
+            # 内联简化版作为 fallback
+            cat > "${SKILL_IMAGINE_SCRIPTS}/main.ts" << 'EOF_SILICONFLOW'
+#!/usr/bin/env bun
+// Fallback simplified version
+interface CliArgs { prompt: string; imagePath: string; model: string; }
+function parseArgs(argv: string[]): CliArgs {
+  const args: CliArgs = { prompt: "", imagePath: "", model: "black-forest-labs/FLUX.1-dev" };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--prompt" || argv[i] === "-p") args.prompt = argv[++i] || "";
+    else if (argv[i] === "--image") args.imagePath = argv[++i] || "";
+    else if (argv[i] === "--model" || argv[i] === "-m") args.model = argv[++i] || args.model;
+  }
+  return args;
+}
+async function generateImage(args: CliArgs): Promise<void> {
+  const apiKey = process.env.SILICONFLOW_API_KEY;
+  if (!apiKey) { console.error("Error: SILICONFLOW_API_KEY not set"); process.exit(1); }
+  console.log(`🎨 Generating image with ${args.model}...`);
+  const response = await fetch("https://api.siliconflow.cn/v1/images/generations", {
+    method: "POST", headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: args.model, prompt: args.prompt, image_size: "1024x1024", num_inference_steps: 20 })
+  });
+  if (!response.ok) { console.error(`❌ API error (${response.status})`); process.exit(1); }
+  const result = await response.json();
+  if (!result.images?.length) { console.error("❌ No images in response"); process.exit(1); }
+  const imageUrl = result.images[0].url;
+  const imageResponse = await fetch(imageUrl);
+  const imageBuffer = await imageResponse.arrayBuffer();
+  await Bun.write(args.imagePath, new Uint8Array(imageBuffer));
+  console.log(`✅ Saved: ${args.imagePath} (${imageBuffer.byteLength} bytes)`);
+}
+const args = parseArgs(process.argv.slice(2));
+if (!args.prompt || !args.imagePath) { console.error("Usage: bun main.ts --prompt <text> --image <path>"); process.exit(1); }
+await generateImage(args);
+EOF_SILICONFLOW
+        fi
+        
+        echo "   ✅ 已配置 SiliconFlow 后端"
+        echo "      模型: Kwai-Kolors/Kolors"
+        echo "      API: https://api.siliconflow.cn/v1/images/generations"
+        echo "      功能: --ar, --size, --quality, --n, --seed, --promptfiles"
+        
+        # 创建包装脚本（baoyu skills 调用 baoyu-imagine 命令）
+        cat > "${WRAPPER_DIR}/baoyu-imagine" << EOF_WRAPPER
+#!/bin/bash
+# SiliconFlow wrapper
+
+# 加载 baoyu-skills .env 文件（绕过 Hermes 环境变量过滤）
+if [ -f ~/.baoyu-skills/.env ]; then
+    set -a
+    source ~/.baoyu-skills/.env
+    set +a
+fi
+
+# 同时尝试从环境变量加载（如果未被过滤）
+export SILICONFLOW_API_KEY="\${SILICONFLOW_API_KEY:-\$SILICONFLOW_API_KEY}"
+
+# 确保图片保存到可访问的目录
+mkdir -p /data/.hermes/image_cache
+cd /data/.hermes/image_cache
+
+exec bun "${SKILL_IMAGINE_SCRIPTS}/main.ts" "\$@"
+EOF_WRAPPER
+        chmod +x "${WRAPPER_DIR}/baoyu-imagine"
+        echo "   ✅ 包装脚本: ${WRAPPER_DIR}/baoyu-imagine"
+    else
+        echo "   ⚠️ 未检测到 SILICONFLOW_API_KEY 或 GEMINI_API_KEY"
+        echo "      图像生成功能不可用"
+        echo "      请设置以下环境变量之一:"
+        echo "        - GEMINI_API_KEY (推荐，图像质量更好)"
+        echo "        - SILICONFLOW_API_KEY (国内可访问)"
+    fi
+    
+    # 7. 设置文件权限（只读，防止 agent 意外修改）
+    chmod -R 555 "${SKILL_IMAGINE_SCRIPTS}/" 2>/dev/null || true
+    echo "   🔒 已锁定 scripts/ 目录"
+    
+    # 8. 创建 skills 目录下的 EXTEND.md 软链接
+    # baoyu-imagine 会优先查找 skill 目录下的 EXTEND.md
+    OLD_EXTEND="/data/.hermes/skills/baoyu-imagine/EXTEND.md"
+    if [ -f "${IMAGINE_EXTEND_FILE}" ]; then
+        mkdir -p "$(dirname "$OLD_EXTEND")"
+        ln -sf "${IMAGINE_EXTEND_FILE}" "$OLD_EXTEND"
+        echo "   🔗 创建 EXTEND.md 软链接: $OLD_EXTEND -> ${IMAGINE_EXTEND_FILE}"
+    fi
+fi
+
+# ==================== 确保 image_cache 目录可写 ====================
+mkdir -p /data/.hermes/image_cache
+chmod 755 /data/.hermes/image_cache
+chown appuser:appuser /data/.hermes/image_cache 2>/dev/null || true
 
 # ==================== 启动数据同步服务 ====================
 SYNC_INTERVAL=${SYNC_INTERVAL:-60}
@@ -571,14 +1125,125 @@ else
 fi
 export AUTH_TOKEN
 
-# ==================== 启动 Web UI (BFF Server) ====================
+# ==================== Web UI 自动更新 ====================
+# Dockerfile 构建时安装的版本可能已过时
+# 每次重启时检查并更新到最新版本
+
+update_hermes_web_ui() {
+    local WEBUI_DIR="/opt/hermes-web-ui"
+    local TEMP_DIR="/tmp/hermes-web-ui-update"
+    
+    echo "🔄 检查 hermes-web-ui 更新..."
+    
+    # 获取远程最新版本
+    local LATEST_VERSION
+    LATEST_VERSION=$(curl -s https://api.github.com/repos/EKKOLearnAI/hermes-web-ui/releases/latest | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
+    
+    if [ -z "$LATEST_VERSION" ]; then
+        echo "   ⚠️ 无法获取远程版本，跳过更新"
+        return 0
+    fi
+    
+    # 获取当前版本
+    local CURRENT_VERSION="unknown"
+    if [ -f "${WEBUI_DIR}/package.json" ]; then
+        CURRENT_VERSION=$(cat "${WEBUI_DIR}/package.json" | grep '"version"' | head -1 | sed -E 's/.*"version": "([^"]+)".*/\1/')
+    fi
+    
+    echo "   当前版本: ${CURRENT_VERSION}"
+    echo "   最新版本: ${LATEST_VERSION}"
+    
+    # 如果版本相同，跳过更新
+    if [ "$CURRENT_VERSION" = "$LATEST_VERSION" ]; then
+        echo "   ✅ 已是最新版本，跳过更新"
+        return 0
+    fi
+    
+    echo "   📥 检测到新版本，开始更新..."
+    
+    # 清理临时目录
+    rm -rf "$TEMP_DIR"
+    mkdir -p "$TEMP_DIR"
+    
+    # 克隆最新代码
+    if ! git clone --depth 1 https://github.com/EKKOLearnAI/hermes-web-ui.git "$TEMP_DIR"; then
+        echo "   ❌ Git clone 失败，保留当前版本"
+        rm -rf "$TEMP_DIR"
+        return 0
+    fi
+    
+    cd "$TEMP_DIR"
+    
+    # 获取克隆后的版本
+    local CLONED_VERSION
+    CLONED_VERSION=$(cat package.json | grep '"version"' | head -1 | sed -E 's/.*"version": "([^"]+)".*/\1/')
+    echo "   克隆版本: ${CLONED_VERSION}"
+    
+    # 如果克隆的版本和当前一样，跳过
+    if [ "$CLONED_VERSION" = "$CURRENT_VERSION" ]; then
+        echo "   ✅ 版本相同，跳过更新"
+        cd /app
+        rm -rf "$TEMP_DIR"
+        return 0
+    fi
+    
+    # 构建（需要 devDependencies）
+    echo "   📦 安装依赖..."
+    if ! npm install; then
+        echo "   ❌ npm install 失败，保留当前版本"
+        cd /app
+        rm -rf "$TEMP_DIR"
+        return 0
+    fi
+    
+    echo "   🔨 构建..."
+    if ! npm run build; then
+        echo "   ❌ 构建失败，保留当前版本"
+        cd /app
+        rm -rf "$TEMP_DIR"
+        return 0
+    fi
+    
+    # 精简（移除 devDependencies）
+    echo "   🧹 精简..."
+    npm prune --omit=dev
+    
+    # 替换旧版本
+    echo "   📝 替换旧版本..."
+    rm -rf "${WEBUI_DIR}.bak" 2>/dev/null || true
+    mv "$WEBUI_DIR" "${WEBUI_DIR}.bak" 2>/dev/null || true
+    mkdir -p "$WEBUI_DIR"
+    cp -r dist node_modules package.json "$WEBUI_DIR/"
+    
+    cd /app
+    rm -rf "$TEMP_DIR" "${WEBUI_DIR}.bak"
+    
+    echo "   ✅ hermes-web-ui 已更新至 ${CLONED_VERSION}"
+}
+
+# 如果设置了 WEBUI_AUTO_UPDATE=true，则执行更新
+if [ "${WEBUI_AUTO_UPDATE:-true}" = "true" ]; then
+    update_hermes_web_ui
+else
+    echo "   ℹ️ Web UI 自动更新已禁用 (WEBUI_AUTO_UPDATE=false)"
+fi
+
+# ==================== 启动 Web UI (BFF Server + Image Proxy) ====================
+# 架构: image-proxy.js (:7860) → BFF (:7861) → Gateway (:8642)
+#
+# image-proxy.js 在 :7860 监听:
+#   /images/      → 图片文件浏览/下载 (来自 /data/.hermes/image_cache)
+#   其他所有请求   → HTTP/WebSocket 透传给 BFF :7861
+# BFF 在 :7861 内部监听 (hermes-web-ui)
 echo "🌐 启动 Hermes Web UI..."
-echo "   BFF Server: http://0.0.0.0:7860"
-echo "   Upstream:   http://127.0.0.1:8642"
+echo "   Image+Proxy: http://0.0.0.0:7860"
+echo "   BFF Server:  http://127.0.0.1:7861"
+echo "   Upstream:    http://127.0.0.1:8642"
+echo "   📷 图片浏览: http://localhost:7860/images/"
 echo ""
 
 # 确保运行时环境变量设置完毕
-export PORT=7860
+export PORT=7861
 export UPSTREAM=http://127.0.0.1:8642
 export HERMES_BIN=/usr/local/bin/hermes
 export HERMES_HOME=/data/.hermes
@@ -594,7 +1259,12 @@ cleanup() {
         python -m src.data_sync backup --force 2>/dev/null || echo "   ⚠️ 备份失败"
     fi
 
-    # 停止各进程（顺序：BFF → Gateway → Sync）
+    # 停止各进程（顺序：ImageProxy → BFF → Gateway → Sync）
+    if [ -n "$PROXY_PID" ] && kill -0 $PROXY_PID 2>/dev/null; then
+        echo "   🛑 停止 Image Proxy..."
+        kill $PROXY_PID 2>/dev/null || true
+        wait $PROXY_PID 2>/dev/null || true
+    fi
     if [ -n "$BFF_PID" ] && kill -0 $BFF_PID 2>/dev/null; then
         echo "   🛑 停止 Web UI..."
         kill $BFF_PID 2>/dev/null || true
@@ -617,15 +1287,15 @@ cleanup() {
 
 trap cleanup SIGTERM SIGINT
 
-# 启动 BFF Server (替代 hermes dashboard)
+# 启动 BFF Server (内部端口 7861, 不对外暴露)
 node /opt/hermes-web-ui/dist/server/index.js &
 BFF_PID=$!
 
 # 等待 BFF 就绪
-echo "   ⏳ 等待 Web UI 就绪..."
+echo "   ⏳ 等待 BFF 就绪 (:7861)..."
 BFF_READY=false
 for i in $(seq 1 20); do
-    if curl -sf http://localhost:7860/health > /dev/null 2>&1; then
+    if curl -sf http://localhost:7861/health > /dev/null 2>&1; then
         BFF_READY=true
         break
     fi
@@ -633,9 +1303,32 @@ for i in $(seq 1 20); do
 done
 
 if [ "$BFF_READY" = true ]; then
-    echo "   ✅ Web UI 已就绪 → http://localhost:7860"
+    echo "   ✅ BFF 已就绪 → http://127.0.0.1:7861"
 else
-    echo "   ⚠️ Web UI 未在 20 秒内就绪，请查看日志"
+    echo "   ⚠️ BFF 未在 20 秒内就绪，请查看日志"
+fi
+
+# 启动 Image Proxy (对外端口 7860, HF Spaces 入口)
+echo "🖼️  启动 Image Proxy..."
+BFF_PORT=7861 LISTEN_PORT=7860 IMAGE_DIR=/data/.hermes/image_cache \
+    node /app/image-proxy.js &
+PROXY_PID=$!
+
+# 等待 Image Proxy 就绪
+PROXY_READY=false
+for i in $(seq 1 10); do
+    if curl -sf http://localhost:7860/health > /dev/null 2>&1; then
+        PROXY_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$PROXY_READY" = true ]; then
+    echo "   ✅ Web UI 已就绪 → http://localhost:7860"
+    echo "   📷 图片浏览 → http://localhost:7860/images/"
+else
+    echo "   ⚠️ Image Proxy 未就绪，Web UI 可能不可用"
 fi
 
 # 再次验证模型配置（BFF 启动可能修改 config.yaml）
@@ -662,5 +1355,6 @@ if [ -f "$CONFIG_FILE" ]; then
     fi
 fi
 
-# 等待 BFF 主进程（前台阻塞，容器生命周期由 BFF 控制）
-wait $BFF_PID
+# 等待 Image Proxy 主进程（前台阻塞，容器生命周期由 Proxy 控制）
+# Proxy 退出通常意味着 BFF 也挂了
+wait $PROXY_PID
